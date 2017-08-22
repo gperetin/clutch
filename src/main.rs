@@ -1,20 +1,25 @@
 extern crate chrono;
 extern crate hipchat_client;
 extern crate serde;
+extern crate termion;
 extern crate toml;
 
 #[macro_use]
 extern crate serde_derive;
 
+use std::thread;
 use std::env;
 use std::fs::File;
 use std::io::prelude::*;
-use std::io::{self, Write};
+use std::io::{self, Write, stdout, Stdout};
 use std::path::Path;
 
 use chrono::prelude::*;
+
 use hipchat_client::Client as HipchatClient;
 use hipchat_client::message::Message;
+use termion::{color, style, async_stdin};
+use termion::raw::IntoRawMode;
 
 const DEFAULT_CONFIG_PATH: &str = "clutch.toml";
 
@@ -38,18 +43,13 @@ fn setup_client(config: &Config) -> HipchatClient {
     HipchatClient::new(config.origin.clone(), config.token.clone())
 }
 
-fn print_message(message: Message) -> () {
+fn print_message(message: Message) -> String {
     let parsed_date = DateTime::parse_from_rfc3339(&message.date);
     let from: String = message.from.map(|x| x.name).unwrap_or("Unknown".to_string());
-    println!("[{}] [{}]: {}",
+    format!("[{}] [{}]: {}",
              parsed_date.unwrap().with_timezone(&Local).format("%m/%d %H:%M").to_string(),
              from,
-             message.message);
-}
-
-fn print_messages(messages: Vec<Message>) -> () {
-    // TODO: find a better way than .count() to consume an iter
-    messages.into_iter().map(|m| print_message(m)).count();
+             message.message)
 }
 
 fn prompt_for_message() -> String {
@@ -81,7 +81,30 @@ fn get_config_path(passed_in: Option<String>) -> String {
         .to_string()
 }
 
+fn render_text(text: &String, stdout: &mut Stdout) -> () {
+    write!(stdout, "{}{}{}",
+           termion::clear::All,
+           termion::cursor::Goto(1,1),
+           text);
+    write!(stdout, "\r\n ------------------------------------------------------------ ");
+    write!(stdout, "\r\n> ");
+    stdout.flush().unwrap();
+}
+
+fn compute_text(messages: &Vec<Message>) -> String {
+    let msgs_to_print = messages.iter().rev().take(15);
+    let mut msgs: Vec<String> = msgs_to_print.into_iter().map(|m| print_message(m.clone())).collect();
+    msgs.reverse();
+    msgs.join("\r\n")
+}
+
+fn send_message(message: &mut String, client: &HipchatClient, room: &String) -> () {
+    client.send_message(room, message.clone());
+    message.clear();
+}
+
 fn main() {
+    let mut stdout = stdout().into_raw_mode().unwrap();
     let config_path = get_config_path(env::args().nth(1));
     let config = load_config(config_path);
     let client = setup_client(&config);
@@ -91,9 +114,56 @@ fn main() {
         .unwrap()
         .items;
 
-    println!("Messages for room {}", config.room);
-    print_messages(messages);
+    render_text(&compute_text(&messages), &mut stdout);
 
-    let message = prompt_for_message();
-    client.send_message(&config.room, message);
+    let mut stdin = async_stdin().bytes();
+    let mut current_message = String::new();
+    loop {
+        let b = stdin.next();
+        match b {
+            None => {
+                thread::sleep_ms(10);
+                continue;
+            },
+            Some(res) => match res {
+                Ok(c) => {
+                    match c {
+                        3 => break,
+                        13 => {
+                            send_message(&mut current_message, &client, &config.room);
+                            write!(stdout, "\r{}> ", termion::clear::AfterCursor).unwrap();
+                            stdout.flush().unwrap();
+                        },
+                        18 => {
+                            // This is Ctrl-R this is how we fetch new messages for now
+                            let messages = client
+                                .get_recent_history(&config.room)
+                                .unwrap()
+                                .items;
+
+                            render_text(&compute_text(&messages), &mut stdout);
+                        },
+                        127 => {
+                            // Backspace
+                            current_message.pop();
+                            write!(stdout, "{} {}",
+                                   termion::cursor::Left(1),
+                                   termion::cursor::Left(1)
+                            ).unwrap();
+                            stdout.flush().unwrap();
+                        },
+                        _ => {
+                            current_message.push(c as char);
+                            write!(stdout, "{}", c as char).unwrap();
+                            //write!(stdout, "{} ", c).unwrap();
+                            stdout.flush().unwrap();
+                        },
+                    }
+                },
+                Err(error) => continue,
+            },
+        }
+    }
+
+    stdout.flush().unwrap();
 }
